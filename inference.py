@@ -1,37 +1,44 @@
-from time import time
+"""
+整个推理的入口，整合所有已知方法(除了sleap)
+## 分步x    
+1. 差分帧计算（可多进程）
+2. 差分帧分类（需要分片）
+3. pv分类（可多gpu多进程）
+"""
 import argparse
-from typing import Union
-import numpy as np
 from datetime import datetime
+from decord import VideoReader
 import logging
-from rich.pretty import pprint
-import os
-# from sleap.io.dataser import labels
-# import sleap
-# from sleap.nn.data.pipelines import (
-#     Provider,
-#     Pipeline,
-#     LabelsReader,
-#     VideoReader,
-#     Normalizer,
-#     Resizer,
-#     Prefetcher,
-#     InstanceCentroidFinder,
-#     KerasModelPredictor,
-# )
 from pathlib import Path
-import pickle
-import shutil
+from tqdm import tqdm
+import cv2
+import time
+import numpy as np
 import pandas as pd
+import multiprocessing
+import functools
 
+import pickle
+from tsfresh import extract_features
+from tsfresh.utilities.dataframe_functions import impute
+from tsfresh.feature_extraction import ComprehensiveFCParameters
+from multiprocessing import Manager,Process
+# from utils import clipSelected_once
+# multiprocessing.set_start_method('forkserver', force=True)
 logger = logging.getLogger(__name__)
 
+import warnings
+warnings.filterwarnings("ignore")
 
-inter = 10
-intra = 40
+target_clas_num = 1
+max_length = 60
+displacement = 10
+step = 60
+windows_size = 60
 area_min = 20
-area_max = 200
 gray_thres = 60
+inter = 10
+intra = 10
 
 def _make_cli_parser() -> argparse.ArgumentParser:
     """Create argument parser for CLI.
@@ -45,23 +52,8 @@ def _make_cli_parser() -> argparse.ArgumentParser:
                         '--recursive',
                         action='store_true',
                         help='recursive find video')
-    parser.add_argument("--suffix", type=str,default="MP4")
-
-    parser.add_argument(
-        "data_path",
-        type=str,
-        nargs="?",
-        default="",
-        help=(
-            "Path to data to predict on. This can be a labels (.slp) file or any "
-            "supported video format."
-        ),
-    )
-    parser.add_argument(
-        "--only_clip",
-        action='store_true',
-        default=False,
-        help='only clip video')
+    parser.add_argument("--video_suffix", type=str,default="mkv")
+    parser.add_argument("-i", "--input_folder", type=str, help="input folder")
     parser.add_argument(
         "-m",
         "--model",
@@ -72,55 +64,14 @@ def _make_cli_parser() -> argparse.ArgumentParser:
             "Multiple models can be specified, each preceded by --model."
         ),
     )
-    # parser.add_argument(
-    #     "--frames",
-    #     type=str,
-    #     default="",
-    #     help=(
-    #         "List of frames to predict when running on a video. Can be specified as a "
-    #         "comma separated list (e.g. 1,2,3) or a range separated by hyphen (e.g., "
-    #         "1-3, for 1,2,3). If not provided, defaults to predicting on the entire "
-    #         "video."
-    #     ),
-    # )
+    #model
     parser.add_argument(
-        "--only-labeled-frames",
-        action="store_true",
-        default=False,
-        help=(
-            "Only run inference on user labeled frames when running on labels dataset. "
-            "This is useful for generating predictions to compare against ground truth."
-        ),
-    )
-    parser.add_argument(
-        "--only-suggested-frames",
-        action="store_true",
-        default=False,
-        help=(
-            "Only run inference on unlabeled suggested frames when running on labels "
-            "dataset. This is useful for generating predictions for initialization "
-            "during labeling."
-        ),
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
+        "--model",
         type=str,
-        default=None,
-        help=(
-            "The output filename to use for the predicted data. If not provided, "
-            "defaults to '[data_path].predictions.slp'."
-        ),
+        default="sleap",
+        help="model path.",
     )
-    parser.add_argument(
-        "--no-empty-frames",
-        action="store_true",
-        default=False,
-        help=(
-            "Clear any empty frames that did not have any detected instances before "
-            "saving to output."
-        ),
-    )
+
     parser.add_argument(
         "--verbosity",
         type=str,
@@ -140,16 +91,6 @@ def _make_cli_parser() -> argparse.ArgumentParser:
         help="Run inference only on CPU. If not specified, will use available GPU.",
     )
     device_group.add_argument(
-        "--first-gpu",
-        action="store_true",
-        help="Run inference on the first GPU, if available.",
-    )
-    device_group.add_argument(
-        "--last-gpu",
-        action="store_true",
-        help="Run inference on the last GPU, if available.",
-    )
-    device_group.add_argument(
         "--gpu",
         type=str,
         default="auto",
@@ -158,326 +99,501 @@ def _make_cli_parser() -> argparse.ArgumentParser:
             " the highest percentage of available memory."
         ),
     )
-    parser.add_argument(
-        "--max_edge_length_ratio",
-        type=float,
-        default=0.25,
-        help="The maximum expected length of a connected pair of points "
-        "as a fraction of the image size. Candidate connections longer "
-        "than this length will be penalized during matching. "
-        "Only applies to bottom-up (PAF) models.",
-    )
-    parser.add_argument(
-        "--dist_penalty_weight",
-        type=float,
-        default=1.0,
-        help="A coefficient to scale weight of the distance penalty. Set "
-        "to values greater than 1.0 to enforce the distance penalty more strictly. "
-        "Only applies to bottom-up (PAF) models.",
-    )
-    parser.add_argument(
-        "--batch_size",
+    device_group.add_argument(
+        "-p",
+        "--process_num",
         type=int,
         default=4,
         help=(
-            "Number of frames to predict at a time. Larger values result in faster "
-            "inference speeds, but require more memory."
+            "Run training on the i-th GPU on the system. If 'auto', run on the GPU with"
+            " the highest percentage of available memory."
         ),
     )
-    parser.add_argument(
-        "--open-in-gui",
-        action="store_true",
-        help="Open the resulting predictions in the GUI when finished.",
-    )
-    parser.add_argument(
-        "--peak_threshold",
-        type=float,
-        default=0.2,
-        help="Minimum confidence map value to consider a peak as valid.",
-    )
-
+    parser.add_argument("output_folder", type=str,default="output_video")
     # Deprecated legacy args. These will still be parsed for backward compatibility but
     # are hidden from the CLI help.
-    parser.add_argument(
-        "--labels",
-        type=str,
-        default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--single.peak_threshold",
-        type=float,
-        default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--topdown.peak_threshold",
-        type=float,
-        default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--bottomup.peak_threshold",
-        type=float,
-        default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--single.batch_size",
-        type=float,
-        default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--topdown.batch_size",
-        type=float,
-        default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--bottomup.batch_size",
-        type=float,
-        default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
-    )
-
     return parser
 
-def run_preprocess(src : Path, workdir : Path,exist_ok=True):
+# 剪裁选中的视频片段，以帧为单位
+def clipSelected_once(vid, dst, start, end):
+    assert isinstance(vid, cv2.VideoCapture)
+    assert end > start
+    # 设置指定帧
+    vid.set(cv2.CAP_PROP_POS_FRAMES,max(start-1, 1))
+    num = end - start +1
+    width = int(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out = cv2.VideoWriter(dst, cv2.VideoWriter_fourcc(*"XVID"),30, (width,height),1)
+
+    for i in range(num):
+        succes, frame = vid.read()
+        if not succes:
+            break
+        out.write(frame)
+    out.release()
+
+
+def cal_video(args_input):
+    src, dst_csv = args_input
+    print("cal_video", src)
+    if Path(dst_csv).exists():
+        print("file exist, ignore compute it. ", src)
+        return
+    try:
+        vid = cv2.VideoCapture(src)
+        succes, prev = vid.read()
+    except cv2.error as error:
+        return
+
+    if not succes:
+        print('no succes')
+        return
+    prev_gray = cv2.cvtColor(prev, cv2.COLOR_RGB2GRAY)
+    wrt = open(dst_csv, 'w+')
+    count = 0
+    launch = time.time()
+    # vid.set(cv2.CAP_PROP_POS_MSEC, 60000)
+    while vid.isOpened():
+        succes, frame = vid.read()
+        if not succes:
+            break
+        # 差分帧和颜色滤波合并
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        #对原始图像作差
+        diff = cv2.absdiff(gray, prev_gray)
+        _, diff = cv2.threshold(diff, 20, 1, cv2.THRESH_BINARY)
+        # kernel = np.ones((2, 2), np.uint8)
+        # erode = cv2.erode(diff,kernel=kernel, iterations=2)
+        # contours, hierarchy = cv2.findContours(erode, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        erode_sum = 0
+        erode_count = 0
+        # for idx, i in enumerate(contours):
+        #     area = cv2.contourArea(i)
+        #     erode_sum+= area
+        #     erode_count += 1
+
+        diffsum = np.sum(diff)
+        wrt.write("{}, {}, {}\n".format(erode_sum, diffsum, erode_count))
+        prev_gray = gray
+        count = count + 1
+    vid.release()
+
+def filter_points(filename):
+    df = pd.read_csv(filename, names=['erode_sum','diffsum', 'erode_count'],header=None)
+    diff = df[(df['erode_sum'] > area_min * 2)]
+    return [diff.index.values.tolist(), df]
+
+def filter(points, min_length, intra,diff_df):
+    res = []
+    batch = {}
+    info = {"avg": 0, "min": 1000000, "max":0, "count":1}
+    for i in points:
+        diff = diff_df.iloc[i,0]
+        if 'end' in batch.keys() and i - batch['end'] < intra:
+            batch['end'] = i
+            info['avg'] = (info['avg'] + diff) / info['count']
+            info['min'] = min(info['min'],diff)
+            info['max'] = max(info['max'],diff)
+        elif 'end' in batch.keys() and i - batch['end'] >= intra:
+            if batch['end'] - batch['st'] >= min_length:
+                info['avg'] = (info['avg'] + diff) / info['count']
+                info['min'] = min(info['min'], diff)
+                info['max'] = max(info['max'], diff)
+                batch['info'] = info.copy()
+                res.append(batch)
+            batch = {}
+            batch['st'] = i
+            batch['end'] = i
+            info = {"avg": 0, "min": 1000000, "max": 0, "count": 1}
+        else:
+            batch['st'] = i
+            batch['end'] = i
+            info = {"avg": diff, "min": diff, "max": diff, "count": 1}
+        info['count'] += 1
+    return res
+
+def get_windows_dataframe(df,start,end,step,windows_size,max_length):
+    # end-start是否少于windows_size
+    if end - start <= windows_size - 1 and start + windows_size - 1 <= max_length:
+        yield df.iloc[start: start + windows_size]
+    else:
+        for i in range(start,min(df.shape[0],end),step):
+            ret_df = df.iloc[i:(i+windows_size),:]
+            yield ret_df
+
+
+def make_dataset_of_framediff(file_name, segment,csvdir,windows_size=60, step=60, seg_size=0,vid=None):
+    csv_list = dict()
+    location_list = []
+    filename_stem = file_name.split('.')[0]
+    signal_list = []
+    signal_index_list = []
+    all_time_id = []
+    count = 0
+    for row in segment:
+        frame_60 = []
+        start = row['st']
+        end = row['end']
+        csv_file = csvdir / file_name
+        if csv_file not in csv_list:
+            csv_list[csv_file] = pd.read_csv(csv_file,names=['erodesum','diffsum20','erode_sum'])
+        csv = csv_list[csv_file]
+
+        max_length = csv.shape[0]
+        # 叠加
+        for segment_60 in get_windows_dataframe(csv,start, min(end, max_length), step=step,windows_size=windows_size,max_length=max_length):
+            start_index = segment_60.index.values[0]
+            end_index = segment_60.index.values[-1]
+            if end_index - start_index != windows_size - 1:
+                continue
+            dst = csvdir  / (filename_stem + '-' + str(start_index) + '-' + str(end_index) + '.mkv')
+            # if not dst.exists():
+            #     clipSelected_once(vid, str(dst), start_index, end_index)
+            frame_60.append((start_index,end_index))
+            signal_list.append(segment_60.to_numpy())
+            signal_index_list.extend([count] * len(segment))
+            all_time_id.extend([tid for tid in range(len(segment_60))])
+            count += 1
+        location_list.append((file_name.split('.')[0],frame_60))
+    if len(signal_list) == 0:
+        return 0, 0
+    signal_np: np.ndarray = np.concatenate(signal_list, axis=0)
+    signal_indexes = np.array(signal_index_list)
+    signal_np = np.concatenate((signal_np,np.expand_dims(signal_indexes, axis=1)),axis=1)
+    X = np.concatenate((signal_np,np.expand_dims(np.array(all_time_id),axis=1)),axis=1)
+    X_df = pd.DataFrame(X, columns=['erodesum','diffsum20','erode_count','id','time'])
+    X_df['id'] = X_df['id'].astype('int')
+    return location_list, X_df
+
+def extract_from_csv(csv_file: str):
+    extraction_settings = ComprehensiveFCParameters()
+    from utils import filter_points, filter
+    pass_points, diff_df = filter_points(csv_file)
+    test_list = []
+    test_index_list = []
+    segment = filter(pass_points, inter, intra, diff_df) 
+    count = 0
+    all_time_id = []
+    info_segment = []
+    for row in segment:
+        seq: pd.core.series.Series = diff_df.iloc[row['st']:max(int(row['st'])+60,int(row['end'])),:]
+        test_list.append(seq.to_numpy())
+        test_index_list.extend([count] * len(seq))
+        all_time_id.extend([tid for tid in range(len(seq))])
+        count += 1
+        info_segment.append(f"{row['st']}-{row['end']}")
+
+    # 拼装pandas dataframe格式
+    if len(test_list) == 0:
+        return 0, 0
+    test_np: np.ndarray = np.concatenate(test_list,axis=0)
+    test_indexes = np.array(test_index_list)
+    test_np = np.concatenate((test_np,np.expand_dims(test_indexes, axis=1)),axis=1)
+    X_test = np.concatenate((test_np,np.expand_dims(np.array(all_time_id),axis=1)),axis=1)
+    X_test = pd.DataFrame(X_test, columns=['erodesum','diffsum20','erode_count','diffsum10','id','time'])
+    X_test['id'] = X_test['id'].astype('int')
+    X_test = extract_features(X_test[['id','time','diffsum20','erodesum']], column_id='id', column_sort='time',
+                        default_fc_parameters=extraction_settings,
+                        # we impute = remove all NaN features automatically
+                        impute_function=impute)
+    
+    return X_test, info_segment
+
+def extract_feature_from_csv_and_segment(segment_list: list,csv_file: str,windows_size=60, step=60,src=None):
     """
-    预处理视频，包括：
-    1. 计算视频的帧间差分
-    2. 过滤帧间差分，得到分段信息
-    3. 根据分段信息，将视频分段
-    返回分段信息和每一段包含哪些帧的列表
+    不切片
     Args:
-    - src 视频文件的Path对象
-    Returns:
-    - segment_df 分段信息
-    - frame_list 每一段包含哪些帧的列表
+    - segment, from filter_point
+    - csv_file, str or path of cal_video output
+    Outputs:
+    - location_list
     """
-    from utils import cal_video,filter_points,filter,clipSelected
-    dst_csv = str(workdir / ("{}.csv".format(src.stem)))
-    print("dest csv",dst_csv)
-    if not(exist_ok and Path(dst_csv).is_file()):
-        cal_video(str(src), dst_csv)
+    count = 0
+    all_time_id = []
+    location_list = [] #输出索引
+    subset_list = [] # 用于暂时保存signal
+    subset_index_list = [] #用于指定id
+    subset_filename = [] # 用于定位视频片段
+    csv_file = Path(csv_file)
+    csv_df = pd.read_csv(csv_file, names=['erode_sum','diffsum', 'erode_count'],header=None)
+    for row in segment_list:
+        # 从文件名中寻找信息匹配
+        filename_stem = csv_file.stem
+        start = row['st']
+        end = row['end']
+        start = int(start)
+        end = int(end)
+        max_length = csv_df.shape[0]
+        segment_str = f"{start}-{end}"
+        for segment in get_windows_dataframe(csv_df,start, min(end, max_length), step=step,windows_size=windows_size,max_length=max_length):
+            start_index = segment.index.values[0]
+            end_index = segment.index.values[-1]
+            if end_index - start_index != windows_size - 1:
+                continue
+            dst = csv_file.parent  / (filename_stem + '-' + str(start_index) + '-' + str(end_index) + '.mkv')
+            # if not dst.exists():
+            #     print("clip")
+            #     clipSelected_once(vid, str(dst), start_index, end_index)
+            location_tmp = {"start": start_index, "end": end_index, "filename": src,'id':count,'segment':segment_str, "csv_file":csv_file}
+            location_list.append(location_tmp)
+            subset_list.append(segment.to_numpy())
+            subset_index_list.extend([count] * len(segment))
+            all_time_id.extend([tid for tid in range(len(segment))])
+            count += 1
+    if len(subset_list) == 0:
+        return 0, 0
+    subset_np: np.ndarray = np.concatenate(subset_list,axis=0)
+    subset_indexes = np.array(subset_index_list)
+    X = np.concatenate((subset_np,np.expand_dims(subset_indexes, axis=1)),axis=1)
+    # 拼装pandas dataframe格式
+    X = np.concatenate((X,np.expand_dims(np.array(all_time_id),axis=1)),axis=1)
+    X_df = pd.DataFrame(X, columns=['erodesum','diffsum20','erode_count','id','time'])
+    X_df['id'] = X_df['id'].astype('int')
+    location_pd = pd.DataFrame(location_list)
+    return X_df, location_pd
+
+def predict_signal(X_df, location_pd,clf):
+    extraction_settings = ComprehensiveFCParameters()
+    # # print(location_pd)
+    # # print(X_df)
+    feature = extract_features(X_df[['id','time','diffsum20']], column_id='id', column_sort='time',
+                        default_fc_parameters=extraction_settings,
+                        impute_function=impute,n_jobs=0)
+    label_pr = clf.predict(feature)
+    location_pd['predict'] = label_pr
+    # location_pd['predict'] = 0
+    return location_pd
+
+def step2(args_input):
+    """一个单独的实例,提取出差分帧信号并分类,针对单个cal_video csv文件"""
+    src, dst_csv = args_input
+    dst_csv = Path(dst_csv)
+    vid = cv2.VideoCapture(src)
     pass_points, diff_df = filter_points(dst_csv)
-    #获得分段信息，包含st,end, info(avg,min,max,count)
-    segment_df = filter(pass_points, inter, intra, diff_df) 
-    dst_prefix = str(workdir / ("{}".format(src.stem) + "-{}-{}-{}.mkv"))
-    clipSelected(src=str(src),dst_prefix=dst_prefix,points=segment_df)
-    frame_list = []
-    for i in segment_df:
-        frame_list += list(range(i['st'], i['end']))
-    logger.info(f"frame_list{len(frame_list)}")
-    return frame_list,segment_df
+    segment = filter(pass_points, inter, intra, diff_df) 
+    X_df, location = extract_feature_from_csv_and_segment(segment, dst_csv, windows_size=60, step=60,src=src)
+    # print(X_df, location)
+    vid.release()
+    # 信号分类算法
+    return [X_df, location]
+
+def step3(location,clas,args_input,video_filename):
+    if location is None:
+        return
+    src, dst_csv = args_input
+    dst_csv = Path(dst_csv)
+    if (dst_csv.parent / (dst_csv.stem + "_res.csv")).exists():
+        return
+    vid = cv2.VideoCapture(str(video_filename))
+    tmp_video_list = []
+    for i in location.index:
+        print(i)
+        filename = Path(location.loc[i,'filename'])
+        
+        start = location.loc[i,'start']
+        end = location.loc[i,'end']
+        count = 0
+        judge_list = []
+        judge_score_list = []
+
+        dst = dst_csv.parent  / (filename.stem + '-' + str(start) + '-' + str(end) + '.mkv')
+        print(filename, dst)
+        if not dst.exists():
+            clipSelected_once(vid,str(dst),start,end)
+        tmp_video_list.append(str(dst))
+    results = clas.predict_batch(tmp_video_list)
+    for result,i in zip(results,location.index):
+        idmax =  int(result['class_ids'][0])
+        score =  result['scores'][0]
+        location.loc[i,'score'] = score
+        location.loc[i, 'behavor'] = idmax # 0 for normal, 1 for scratching
+        if idmax == target_clas_num:  # 如果是想要的抓挠类
+            count += 1
+    location.to_csv(dst_csv.parent / (dst_csv.stem + "_res.csv"),mode = 'w')
+    vid.release()
+
+def clip_predict(args_input):
+    src, dst_csv = args_input
+    dst_csv = Path(dst_csv)
+
+def cpu_process(queue, i):
+    """
+    cpu工作，包含calvideo和后面的"""
+    print("begin cpu_process", queue, i)
+    with open('20221201-v4-ds20221118.pickle', 'rb') as fw:
+        clf = pickle.load(fw)
+    cal_video(i)
+    src, dst_csv = i
+    dst_csv = Path(dst_csv)
+    src = Path(src)
+    pass_points, diff_df = filter_points(dst_csv)
+    segment = filter(pass_points, inter, intra, diff_df) 
+    X_df, location = extract_feature_from_csv_and_segment(segment, dst_csv, windows_size=60, step=60, src=src)
+    if (dst_csv.parent/(dst_csv.stem+"_location_sig_sc.csv")).exists():
+        location_pd = pd.read_csv(str((dst_csv.parent/(dst_csv.stem+"_location_sig_sc.csv"))))
+        video_filename = ''
+    else:
+        if isinstance(X_df, int):
+            return
+        location_pd = predict_signal(X_df, location,clf)
+        if location_pd.shape[0] == 0:
+            return
+        video_filename = Path(location_pd.loc[0,'filename'])
+        if (dst_csv.parent / (dst_csv.stem + "_res.csv")).exists():
+            return
+        vid = cv2.VideoCapture(str(video_filename))
+        for j in location.index:
+            print(j)
+            filename = Path(location.loc[j,'filename'])
+            
+            start = location.loc[j,'start']
+            end = location.loc[j,'end']
+
+
+            dst = dst_csv.parent  / (filename.stem + '-' + str(start) + '-' + str(end) + '.mkv')
+            print(filename, dst)
+            if not dst.exists():
+                clipSelected_once(vid,str(dst),start,end)
+        location_pd.to_csv(video_filename.parent/(video_filename.stem+"_location_sig_sc.csv"))
+    queue.put([i, video_filename])
+    print('cpu part log: ', i ,video_filename, queue.empty())
+
+class Func(object):
+    def __init__(self):
+        # 利用匿名函数模拟一个不可序列化象
+        # 更常见的错误写法是，在这里初始化一个数据库的长链接
+        self.num = lambda: None
+
+    def work(self, num=None):
+        self.num = num
+        return self.num
+
+    @staticmethod
+    def call_back(res):
+        print(f'Hello,World! {res}')
+
+    @staticmethod
+    def err_call_back(err):
+        print(f'出错啦~ error：{str(err)}')
+
+def main_split(args: list = None):
+    """Entrypoint for `MOUSEACTION` CLI for running inference.
+
+    Args:
+        args: A list of arguments to be passed into mouse-action.
+    """
+    start_timestamp = str(datetime.now())
+    logger.info("Started inference at:", start_timestamp)
+    parser = _make_cli_parser()
+    args, _ = parser.parse_known_args(args=args)
+    logger.info("Args:")
+    logger.info(vars(args))
+    input_path = Path(args.input_folder)
+    if input_path.is_file():
+        video_list = [input_path]
+    else:
+        video_list = input_path.rglob(f"*.{args.video_suffix}") \
+            if args.recursive \
+            else input_path.glob(f"*.{args.video_suffix}")
+    # 组装多进程的任务入参
+    list_args = []
+    video_list = [i for i in video_list]
+    for video_filename in video_list:
+        workdir =  video_filename.parent
+        workdir = Path(str(workdir).replace(str(input_path),args.output_folder))
+        workdir.mkdir(exist_ok=True,parents=True)
+        newcsv_file = workdir / (video_filename.stem + ".csv")
+        list_args.append([str(video_filename),str(newcsv_file)])
+    
+    queue = Manager().Queue()
+
+    cpu_pool = multiprocessing.Pool(processes=4)
+    for i in list_args:
+        cpu_pool.apply_async(cpu_process,args=(queue,i),error_callback=Func.err_call_back)
+    from ppvideo import PaddleVideo
+    # TODO: 修改为入参
+    model_str = args.model
+    # model_str = "/home/chenmin/PaddleVideo-old/inference/ppTSM20230224rat-v2/ppTSM_rat_pku_20230224"
+    # model_str = "/home/chenmin/PaddleVideo-old/inference/ppTSM20221208/ppTSM_mouse_20220613"
+    clas = PaddleVideo(model_file= model_str +'.pdmodel',
+                    params_file= model_str  + '.pdiparams',
+                    use_gpu=True,use_tensorrt=False,batch_size=4)
+    count = 0
+    dest_count = len(list_args)
+    while True:
+        if count == dest_count:
+            break
+        if not queue.empty():
+            print("init inference")
+            arg_item, video_filename = queue.get(True)
+            count += 1
+            if video_filename == '':
+                continue
+            if (video_filename.parent/(video_filename.stem+"_location_sig_sc.csv")).exists():
+                location = pd.read_csv(str((video_filename.parent/(video_filename.stem+"_location_sig_sc.csv"))))
+                # print(arg_item, video_filename, location.loc[0,'filename'])
+                scratching_location = location
+                # scratching_location = location[location['predict'] == target_clas_num]
+                step3(scratching_location, clas,arg_item, video_filename)
+            else:
+                print("video _location_sc don't exist")
+        else:
+            time.sleep(5)
+    cpu_pool.close()
+    cpu_pool.join()
 
 
 def main(args: list = None):
-    """Entrypoint for `mouse-sleap` CLI for running inference.
+    """Entrypoint for `MOUSEACTION` CLI for running inference.
 
     Args:
-        args: A list of arguments to be passed into mouse-sleap.
+        args: A list of arguments to be passed into mouse-action.
     """
-
-    #第一步：计算长视频的差分帧信息，存放到‘.csv’文件中，sleap信息存放在‘.h5’文件中
-    t0 = time()
     start_timestamp = str(datetime.now())
-    print("Started inference at:", start_timestamp)
-
-    # Setup CLI.
+    logger.info("Started inference at:", start_timestamp)
     parser = _make_cli_parser()
     args, _ = parser.parse_known_args(args=args)
-    print("Args:")
-    pprint(vars(args))
-    print()
-
-    output_path = args.output
-    print(output_path)
-    # Setup output device
-    root_path = Path(args.data_path)
-    output_path = Path(output_path)
-    video_suffix = args.suffix
-    recursive = args.recursive
-    if root_path.is_file():
-        video_list = [root_path]
+    logger.info("Args:")
+    logger.info(vars(args))
+    input_path = Path(args.input_folder)
+    if input_path.is_file():
+        video_list = [input_path]
     else:
-        video_list = root_path.rglob(f"*.{video_suffix}") if recursive else root_path.glob(f"*.{video_suffix}")
-
-
-    # Setup devices.
-#    if args.cpu or not sleap.nn.system.is_gpu_system():
-#        sleap.nn.system.use_cpu_only()
-#    else:
-#        if args.first_gpu:
-#            sleap.nn.system.use_first_gpu()
-#        elif args.last_gpu:
-#            sleap.nn.system.use_last_gpu()
-#        else:
-#            if args.gpu == "auto":
-#                free_gpu_memory = sleap.nn.system.get_gpu_memory()
-#                if len(free_gpu_memory) > 0:
-#                    gpu_ind = np.argmax(free_gpu_memory)
-#                    logger.info(
-#                        f"Auto-selected GPU {gpu_ind} with {free_gpu_memory} MiB of "
-#                        "free memory."
-#                    )
-#                else:
-#                    logger.info(
-#                        "Failed to query GPU memory from nvidia-smi. Defaulting to "
-#                        "first GPU."
-#                    )
-#                    gpu_ind = 0
-#            else:
-#                gpu_ind = int(args.gpu)
-#            sleap.nn.system.use_gpu(gpu_ind)
-#    sleap.disable_preallocation()
-#    # Load model
-#    if args.models is not None:
-#        predictor: Predictor = sleap.load_model(
-#            args.models,
-#            peak_threshold=args.peak_threshold,
-#            batch_size=args.batch_size,
-#            refinement="integral",
-#            progress_reporting=args.verbosity,
-#        )
-#    else:
-#        predictor = sleap.load_model("weights/221113_110806.single_instance.n=697")
-#
-    # Extract suggestion frame by frame difference algorithm.
-    """
-    对于每一个视频文件，首先计算差分帧，然后根据差分帧的信息，进行潜在行为片段提取
-    """
+        video_list = input_path.rglob(f"*.{args.video_suffix}") \
+            if args.recursive \
+            else input_path.glob(f"*.{args.video_suffix}")
+    # 组装多进程的任务入参
+    list_args = []
+    video_list = [i for i in video_list]
     for video_filename in video_list:
         workdir =  video_filename.parent
-        workdir = Path(str(workdir).replace(str(root_path),str(output_path)))
+        workdir = Path(str(workdir).replace(str(input_path),args.output_folder))
         workdir.mkdir(exist_ok=True,parents=True)
-        output_stem = str(workdir/video_filename.stem)
-        # frame_list表示哪些帧会被提取
-        frame_list,info = run_preprocess(video_filename, workdir)
-        logger.info(f"{len(frame_list)}")
-        # logger.info(frame_list)
-        if len(frame_list) == 0:
-            logger.warning(f"Current file '{video_filename}' has not frame difference")
-            continue
-        # if Path(output_stem+".slp").is_file():
-        #     logger.warn(f"Current file '{video_filename}' has already inferenced")
-        #     continue
-#        provider = VideoReader.from_filepath(
-#            filename=str(video_filename), example_indices=frame_list
-#        )
-#        labels_pr: Union[list[dict[str, np.ndarray]], sleap.Labels] = predictor.predict(provider)
-#        labels_pr.save(output_stem)
-        # postprocess
-#        from sleap.info.write_tracking_h5 import main as write_analysis
-#        video_callback = Labels.make_video_callback(str(video_filename))
-#        labels: Labels = Labels.load_file(output_stem+".slp", video_search=video_callback)
-#        write_analysis(
-#                labels,
-#                output_path=output_stem+'.h5',
-#                labels_path=output_stem+".slp",
-#                all_frames=True,
-#        )
-    #第二步：提取‘.h5’中的sleap识别信息，并输出到‘_re.csv’中
-    if args.only_clip: #只想提取潜在行为片段，不想进行后续识别
-        return
-    # print('begin 2')
-    # from utils import export_csv
-    # fileList = os.listdir(output_path)
-    # for file in fileList:
-    #     path = os.path.join(output_path, file)
-    #     if(path[-2:] == 'h5'):
-    #         export_csv(path, path+'_re.csv')
+        newcsv_file = workdir / (video_filename.stem + ".csv")
+        list_args.append([str(video_filename),str(newcsv_file)])
+    # 多进程执行第一步，cal_video
+    p = multiprocessing.Pool(processes=10)
+    with tqdm(total=len(list_args),) as t:
+        for _ in p.imap(cal_video, list_args):
+            t.update()
+        p.close()
+        p.join()
 
-    #第三步：将‘_re.csv’中的hind信息拼接到‘.csv’中，结果保存到‘_withHind.csv’中
-    # print('begin 3')
-    # from utils import fillData
-    # fileList = os.listdir(output_path)
-    # for file in fileList:
-    #     path = os.path.join(output_path, file)
-    #     if(path[-2:] == 'h5'):
-    #         print(path)
-    #         if Path(path[:-3]+'_withHind.csv').exists():
-    #             print('Already exit, ignore it. ', path[:-3]+'_withHind.csv')
-    #             continue
-    #         tar_csv = pd.read_csv(path[:-3]+'.csv',)
-    #         res_csv = pd.read_csv(path[:-3]+'_re.csv')
-    #         print(list(res_csv.columns))
-    #         # if 'hind part_x' not in list(res_csv.columns):
-    #         #     continue
-    #         hind_x = list(np.array(res_csv['hind part_x']))
-    #         hind_y = list(np.array(res_csv['hind part_y']))
-            
-    #         hind_x = fillData(hind_x)
-    #         hind_y = fillData(hind_y)
-    #         # print(tar_csv.columns)
-    #         tar_csv.insert(4, hind_x[0], np.append(hind_x[1:], [0] * (len(tar_csv) - len(hind_x) + 1)))
-    #         tar_csv.insert(5, hind_y[0] + 0.1, np.append(hind_y[1:], [0] * (len(tar_csv) - len(hind_y) + 1)))
-    #         outputpath= path[:-3]+'_withHind.csv'
-    #         tar_csv.to_csv(outputpath,sep=',',index=False,header=True)
-
-    #第四步：调用模型识别是否为抓挠(前提是模型已经训练好了) 不知道脚本里面输入怎么写就暂时写死
-    # print('begin 4')
-    # from utils import predict
-    # with open(Path('./dashu-v1-20221205.pickle'), 'rb') as fw:
-    #     clf=pickle.load(fw)
-    #     event_dicts = predict(output_path,True, clf)
-    #     print(event_dicts)
-
-    #第五步：创建ScratchingEvent列表并返回，将结果输出在‘文件名_res.csv’中，其中没行信息代表一个差分帧识别到的动作片段
-    #每一行的信息包含：id,开始时间，结束时间，是否是抓挠（1是0不是），如果是抓挠抓挠哪一侧（-1为识别到，1为左侧，0为右侧）
-    # from utils import ScratchingEvent, judge_side
-    # for key in event_dicts:
-    #     sc_list = []
-    #     info = event_dicts[key]
-    #     video_info = pd.read_csv(str(output_path) + '/' + key.split('_')[0] + '_re.csv')
-    #     i = 0
-    #     seg = info['seg'][0]
-    #     count_sc = 0
-    #     count_non = 0
-    #     while True:
-    #         if info['seg'][i] == seg:
-    #             if info['predict'][i] == 1:
-    #                 count_sc += 1
-    #             else:
-    #                 count_non += 1
-    #         else:
-    #             event_piece = ScratchingEvent()
-    #             if count_sc >= count_non:
-    #                 event_piece.type = 1
-    #             else:
-    #                 event_piece.type = 0
-    #             event_piece.start_frame = int(seg.split('-')[0])
-    #             event_piece.end_frame = int(seg.split('-')[1])
-    #             event_piece.start_time = event_piece.start_frame/120
-    #             event_piece.end_time = event_piece.end_frame/120
-    #             if event_piece.type == 1:
-    #                 event_piece.side = judge_side(event_piece, video_info)
-    #             sc_list.append(event_piece)
-    #             if info['predict'][i] == 1:
-    #                 count_sc = 1
-    #                 count_non = 0
-    #             else:
-    #                 count_sc = 0
-    #                 count_non = 1
-    #             seg = info['seg'][i]
-    #         i += 1
-    #         if i == info.size/2:
-    #             event_piece = ScratchingEvent()
-    #             if count_sc >= count_non:
-    #                 event_piece.type = 1
-    #             else:
-    #                 event_piece.type = 0
-    #             event_piece.start_frame = int(seg.split('-')[0])
-    #             event_piece.end_frame = int(seg.split('-')[1])
-    #             event_piece.start_time = event_piece.start_frame/120
-    #             event_piece.end_time = event_piece.end_frame/120
-    #             if event_piece.type == 1:
-    #                 event_piece.side = judge_side(event_piece, video_info)
-    #             sc_list.append(event_piece)
-    #             break
-    #     pd.DataFrame([i.__dict__() for i in sc_list]).to_csv(str(output_path) + '/' + key.split('_')[0] + '_res.csv')
+    from ppvideo import PaddleVideo
     
+    # model_str = "/home/chenmin/PaddleVideo-old/inference/ppTSM20221208/ppTSM_mouse_20220613"
+    model_str = args.model
+    clas = PaddleVideo(model_file= model_str +'.pdmodel',
+                    params_file= model_str  + '.pdiparams',
+                    use_gpu=True,use_tensorrt=False,batch_size=16)
+    for arg_item,video_filename in zip(list_args,video_list):
+        if (video_filename.parent/(video_filename.stem+"_res.csv")).exists():
+            location = pd.read_csv(str((video_filename.parent/(video_filename.stem+"_res.csv"))))
+            print(arg_item, video_filename, location.loc[0,'filename'])
+            scratching_location = location[location['predict'] == target_clas_num]
+            step3(scratching_location, clas,arg_item, video_filename)
 
 if __name__ == "__main__":
-    main()
+    main_split()
+    # main()
+    print("\n")
