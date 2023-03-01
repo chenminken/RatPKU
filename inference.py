@@ -352,18 +352,6 @@ def extract_feature_from_csv_and_segment(segment_list: list,csv_file: str,window
     location_pd = pd.DataFrame(location_list)
     return X_df, location_pd
 
-def predict_signal(X_df, location_pd,clf):
-    extraction_settings = ComprehensiveFCParameters()
-    # # print(location_pd)
-    # # print(X_df)
-    feature = extract_features(X_df[['id','time','diffsum20']], column_id='id', column_sort='time',
-                        default_fc_parameters=extraction_settings,
-                        impute_function=impute,n_jobs=0)
-    label_pr = clf.predict(feature)
-    location_pd['predict'] = label_pr
-    # location_pd['predict'] = 0
-    return location_pd
-
 def step2(args_input):
     """一个单独的实例,提取出差分帧信号并分类,针对单个cal_video csv文件"""
     src, dst_csv = args_input
@@ -393,8 +381,6 @@ def step3(location,clas,args_input,video_filename):
         start = location.loc[i,'start']
         end = location.loc[i,'end']
         count = 0
-        judge_list = []
-        judge_score_list = []
 
         dst = dst_csv.parent  / (filename.stem + '-' + str(start) + '-' + str(end) + '.mkv')
         print(filename, dst)
@@ -416,48 +402,6 @@ def clip_predict(args_input):
     src, dst_csv = args_input
     dst_csv = Path(dst_csv)
 
-def cpu_process(queue, i):
-    """
-    cpu工作，包含calvideo和后面的"""
-    print("begin cpu_process", queue, i)
-    with open('20221201-v4-ds20221118.pickle', 'rb') as fw:
-        clf = pickle.load(fw)
-    cal_video(i)
-    src, dst_csv = i
-    dst_csv = Path(dst_csv)
-    src = Path(src)
-    pass_points, diff_df = filter_points(dst_csv)
-    segment = filter(pass_points, inter, intra, diff_df) 
-    X_df, location = extract_feature_from_csv_and_segment(segment, dst_csv, windows_size=60, step=60, src=src)
-    if (dst_csv.parent/(dst_csv.stem+"_location_sig_sc.csv")).exists():
-        location_pd = pd.read_csv(str((dst_csv.parent/(dst_csv.stem+"_location_sig_sc.csv"))))
-        video_filename = ''
-    else:
-        if isinstance(X_df, int):
-            return
-        location_pd = predict_signal(X_df, location,clf)
-        if location_pd.shape[0] == 0:
-            return
-        video_filename = Path(location_pd.loc[0,'filename'])
-        if (dst_csv.parent / (dst_csv.stem + "_res.csv")).exists():
-            return
-        vid = cv2.VideoCapture(str(video_filename))
-        for j in location.index:
-            print(j)
-            filename = Path(location.loc[j,'filename'])
-            
-            start = location.loc[j,'start']
-            end = location.loc[j,'end']
-
-
-            dst = dst_csv.parent  / (filename.stem + '-' + str(start) + '-' + str(end) + '.mkv')
-            print(filename, dst)
-            if not dst.exists():
-                clipSelected_once(vid,str(dst),start,end)
-        location_pd.to_csv(video_filename.parent/(video_filename.stem+"_location_sig_sc.csv"))
-    queue.put([i, video_filename])
-    print('cpu part log: ', i ,video_filename, queue.empty())
-
 class Func(object):
     def __init__(self):
         # 利用匿名函数模拟一个不可序列化象
@@ -475,73 +419,6 @@ class Func(object):
     @staticmethod
     def err_call_back(err):
         print(f'出错啦~ error：{str(err)}')
-
-def main_split(args: list = None):
-    """Entrypoint for `MOUSEACTION` CLI for running inference.
-
-    Args:
-        args: A list of arguments to be passed into mouse-action.
-    """
-    start_timestamp = str(datetime.now())
-    logger.info("Started inference at:", start_timestamp)
-    parser = _make_cli_parser()
-    args, _ = parser.parse_known_args(args=args)
-    logger.info("Args:")
-    logger.info(vars(args))
-    input_path = Path(args.input_folder)
-    if input_path.is_file():
-        video_list = [input_path]
-    else:
-        video_list = input_path.rglob(f"*.{args.video_suffix}") \
-            if args.recursive \
-            else input_path.glob(f"*.{args.video_suffix}")
-    # 组装多进程的任务入参
-    list_args = []
-    video_list = [i for i in video_list]
-    for video_filename in video_list:
-        workdir =  video_filename.parent
-        workdir = Path(str(workdir).replace(str(input_path),args.output_folder))
-        workdir.mkdir(exist_ok=True,parents=True)
-        newcsv_file = workdir / (video_filename.stem + ".csv")
-        list_args.append([str(video_filename),str(newcsv_file)])
-    
-    queue = Manager().Queue()
-
-    cpu_pool = multiprocessing.Pool(processes=4)
-    for i in list_args:
-        cpu_pool.apply_async(cpu_process,args=(queue,i),error_callback=Func.err_call_back)
-    from ppvideo import PaddleVideo
-    # TODO: 修改为入参
-    model_str = args.model
-    # model_str = "/home/chenmin/PaddleVideo-old/inference/ppTSM20230224rat-v2/ppTSM_rat_pku_20230224"
-    # model_str = "/home/chenmin/PaddleVideo-old/inference/ppTSM20221208/ppTSM_mouse_20220613"
-    clas = PaddleVideo(model_file= model_str +'.pdmodel',
-                    params_file= model_str  + '.pdiparams',
-                    use_gpu=True,use_tensorrt=False,batch_size=4)
-    count = 0
-    dest_count = len(list_args)
-    while True:
-        if count == dest_count:
-            break
-        if not queue.empty():
-            print("init inference")
-            arg_item, video_filename = queue.get(True)
-            count += 1
-            if video_filename == '':
-                continue
-            if (video_filename.parent/(video_filename.stem+"_location_sig_sc.csv")).exists():
-                location = pd.read_csv(str((video_filename.parent/(video_filename.stem+"_location_sig_sc.csv"))))
-                # print(arg_item, video_filename, location.loc[0,'filename'])
-                scratching_location = location
-                # scratching_location = location[location['predict'] == target_clas_num]
-                step3(scratching_location, clas,arg_item, video_filename)
-            else:
-                print("video _location_sc don't exist")
-        else:
-            time.sleep(5)
-    cpu_pool.close()
-    cpu_pool.join()
-
 
 def main(args: list = None):
     """Entrypoint for `MOUSEACTION` CLI for running inference.
@@ -579,6 +456,24 @@ def main(args: list = None):
         p.close()
         p.join()
 
+    with tqdm(total=len(list_args),) as t:
+        for location in p.imap(step2, list_args):
+            t.update()  
+            count+=1
+            if isinstance(location[0], int):
+                continue
+            src = Path(list_args[count][0])
+            if (src.parent/(src.stem+"_location.csv")).exists():
+                location_pd = pd.read_csv(str((src.parent/(src.stem+"_location.csv"))))
+            else:
+                location_pd = location[1]
+                location_pd['predict'] = 0
+                if location_pd.shape[0] == 0:
+                    continue
+                video_filename = Path(location_pd.loc[0,'filename'])
+                location_pd.to_csv(video_filename.parent/(video_filename.stem+"_location.csv"))
+        p.close()
+        p.join()
     from ppvideo import PaddleVideo
     
     # model_str = "/home/chenmin/PaddleVideo-old/inference/ppTSM20221208/ppTSM_mouse_20220613"
