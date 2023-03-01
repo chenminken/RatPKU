@@ -483,7 +483,7 @@ def main(args: list = None):
                     use_gpu=True,use_tensorrt=False,batch_size=16)
     for arg_item,video_filename in zip(list_args,video_list):
         if (video_filename.parent/(video_filename.stem+"_res.csv")).exists():
-            location = pd.read_csv(str((video_filename.parent/(video_filename.stem+"_res.csv"))))
+            location = pd.read_csv(str((video_filename.parent/(video_filename.stem+"_location.csv"))))
             print(arg_item, video_filename, location.loc[0,'filename'])
             scratching_location = location[location['predict'] == target_clas_num]
             step3(scratching_location, clas,arg_item, video_filename)
