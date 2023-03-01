@@ -455,7 +455,7 @@ def main(args: list = None):
             t.update()
         p.close()
         p.join()
-
+    p = multiprocessing.Pool(processes=4)
     with tqdm(total=len(list_args),) as t:
         for location in p.imap(step2, list_args):
             t.update()  
